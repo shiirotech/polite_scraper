@@ -21,3 +21,6 @@ __pycache__/
 
 # Cache
 cache/
+
+# Output
+output/
