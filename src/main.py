@@ -40,14 +40,19 @@ def get_time() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def fetch(url: str, headers: dict[str, str], cache_file: Path) -> bool:
+def fetch(url: str, headers: dict[str, str], cache_file: Path) -> tuple[bool, datetime]:
     if cache_file.exists():
+        metadata_file = cache_file.with_suffix(".json")
+        fetched_at = datetime.fromisoformat(
+            json.loads(metadata_file.read_text(encoding="utf-8"))["fetched_at"]
+        )
+
         html = cache_file.read_bytes()
 
         print("CACHE HIT")
         print(f"Size of the file: {len(html)} bytes")
 
-        return False
+        return (False, fetched_at)
 
     else:
         try:
@@ -65,15 +70,23 @@ def fetch(url: str, headers: dict[str, str], cache_file: Path) -> bool:
         if response.status_code != 200:
             response.raise_for_status()
 
+        fetched_at = get_time()
+
         html = response.content
 
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_bytes(html)
 
+        metadata_file = cache_file.with_suffix(".json")
+        metadata_file.write_text(
+            json.dumps({"fetched_at": fetched_at.isoformat()}),
+            encoding="utf-8"
+        )
+
         print("FETCH")
         print(f"Size of the file: {len(html)} bytes")
 
-        return True
+        return (True, fetched_at)
 
 
 def parse(cache_file: Path) -> BeautifulSoup:
@@ -109,7 +122,7 @@ def find_next_url(html: BeautifulSoup, page_url: str) -> str | None:
     return next_url
 
 
-def extract_data(html: BeautifulSoup, abs_url: str, source_url: str) -> Book:
+def extract_data(html: BeautifulSoup, fetched_at: datetime, abs_url: str, source_url: str) -> Book:
     # Getting title as text
     title = html.select_one("h1").get_text(strip=True)
 
@@ -150,8 +163,7 @@ def extract_data(html: BeautifulSoup, abs_url: str, source_url: str) -> Book:
     # Getting source page as text
     source_page = source_url
 
-    # Getting fetched_at as datetime
-    fetched_at = get_time()
+    # Getting fetched_at as datetime (already gotten from fetch())
 
     book = Book(
         title=title,
@@ -212,7 +224,7 @@ if __name__ == "__main__":
         cache_file = Path(f"cache/catalogue-page-{pages_processed + 1}.html")
 
         try:
-            fetched = fetch(page_url, HEADERS, cache_file)
+            fetched, fetched_at = fetch(page_url, HEADERS, cache_file)
 
         except (requests.exceptions.HTTPError, requests.Timeout):
             failed_pages += 1
@@ -248,7 +260,7 @@ if __name__ == "__main__":
         cache_file = Path(f"cache/book-{book_number}.html")
 
         try:
-            fetched = fetch(abs_url, HEADERS, cache_file)
+            fetched, fetched_at = fetch(abs_url, HEADERS, cache_file)
             
         except (requests.exceptions.HTTPError, requests.Timeout):
             failed_pages += 1
@@ -263,7 +275,7 @@ if __name__ == "__main__":
             parsed = parse(cache_file)
 
             try:
-                record = extract_data(parsed, abs_url, source_url)
+                record = extract_data(parsed, fetched_at, abs_url, source_url)
 
             except ValidationError as e:
                 errors.append(
@@ -294,5 +306,3 @@ if __name__ == "__main__":
                     failed_pages=failed_pages)
 
     write_run_report_json(report, OUTPUT_REPORT)
-    
-    # notes for future: make fetched_at to be updated only during the initial fetch
