@@ -26,8 +26,18 @@ class Error(BaseModel):
     book_number: int
 
 
+class Report(BaseModel):
+    start_time: datetime
+    duration: float
+    pages_fetched: int
+    cache_hits: int
+    valid_records: int
+    invalid_records: int
+    failed_pages: int
+
+
 def get_time() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    return datetime.now(timezone.utc)
 
 
 def fetch(url: str, headers: dict[str, str], cache_file: Path) -> bool:
@@ -40,7 +50,17 @@ def fetch(url: str, headers: dict[str, str], cache_file: Path) -> bool:
         return False
 
     else:
-        response = requests.get(url, headers=headers, timeout=5)
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+
+        except requests.Timeout:
+            sleep(5)
+            response = requests.get(url, headers=headers, timeout=5)
+
+        else:
+            if 500 <= response.status_code < 600:
+                sleep(5)
+                response = requests.get(url, headers=headers, timeout=5)
 
         if response.status_code != 200:
             response.raise_for_status()
@@ -159,40 +179,65 @@ def write_json(iterable: list[BaseModel], output_path: Path) -> None:
     )
 
 
+def write_run_report_json(data: Report, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report = data.model_dump(mode="json")
+
+    output_path.write_text(
+        json.dumps(report, indent=2),
+        encoding="utf-8"
+    )
+
+
 URL = "https://books.toscrape.com/"
 HEADERS = { "User-Agent": "https://github.com/shiirotech/polite_scraper" }
 OUTPUT_SUCCESS = Path("output/books.json")
 OUTPUT_FAIL = Path("output/errors.json")
+OUTPUT_REPORT = Path("output/run-report.json")
 
 
 if __name__ == "__main__":
     # === Getting first 3 pages of books ===
     pages_processed = 0
+    pages_fetched = 0
+    pages_from_cache = 0
+    failed_pages = 0
+
     page_url = URL
     book_links = {}
+    start_time = get_time()
 
     while pages_processed < 3:
         cache_file = Path(f"cache/catalogue-page-{pages_processed + 1}.html")
 
-        fetched = fetch(page_url, HEADERS, cache_file)
+        try:
+            fetched = fetch(page_url, HEADERS, cache_file)
 
-        parsed = parse(cache_file)
+        except (requests.exceptions.HTTPError, requests.Timeout):
+            failed_pages += 1
 
-        book_links.update(find_book_links(parsed, page_url))
+        else:
+            if fetched:
+                sleep(1)
+                pages_fetched += 1
+            else:
+                pages_from_cache += 1
 
-        page_url = find_next_url(parsed, page_url)
+            parsed = parse(cache_file)
+
+            book_links.update(find_book_links(parsed, page_url))
+
+            page_url = find_next_url(parsed, page_url)
+
+            if page_url is None:
+                break
 
         pages_processed += 1
 
-        if page_url is None:
-            break
-
-        if fetched:
-            sleep(1)
-
     print(f"\ncatalogue_pages={pages_processed}")
     print(f"discovered={len(book_links)}\n")
-
+    
 
     # === Getting 60 book records ===
     book_number = 1
@@ -202,30 +247,52 @@ if __name__ == "__main__":
     for abs_url, source_url in book_links.items():
         cache_file = Path(f"cache/book-{book_number}.html")
 
-        fetched = fetch(abs_url, HEADERS, cache_file)
-
-        parsed = parse(cache_file)
-
         try:
-            record = extract_data(parsed, abs_url, source_url)
+            fetched = fetch(abs_url, HEADERS, cache_file)
+            
+        except (requests.exceptions.HTTPError, requests.Timeout):
+            failed_pages += 1
 
-        except ValidationError as e:
-            errors.append(
-                Error(error_detail=str(e),
-                      book_url=abs_url,
-                      book_number=book_number)
-            )
         else:
-            book_records.append(record)
+            if fetched:
+                sleep(1)
+                pages_fetched += 1
+            else:
+                pages_from_cache += 1
+
+            parsed = parse(cache_file)
+
+            try:
+                record = extract_data(parsed, abs_url, source_url)
+
+            except ValidationError as e:
+                errors.append(
+                    Error(error_detail=str(e),
+                        book_url=abs_url,
+                        book_number=book_number)
+                )
+            else:
+                book_records.append(record)
 
         book_number += 1
             
-        if fetched:
-            sleep(1)
-
     write_json(book_records, OUTPUT_SUCCESS)
     write_json(errors, OUTPUT_FAIL)
 
-    print(f"\ndetail_pages={len(book_records)}")
+    end_time = get_time()
+
+    print(f"\ndetail_pages={len(book_records) + len(errors)}")
+
+
+    # === Generate report ===
+    report = Report(start_time=start_time,
+                    duration=(end_time - start_time).total_seconds(),
+                    pages_fetched=pages_fetched,
+                    cache_hits=pages_from_cache,
+                    valid_records=len(book_records),
+                    invalid_records=len(errors),
+                    failed_pages=failed_pages)
+
+    write_run_report_json(report, OUTPUT_REPORT)
     
     # notes for future: make fetched_at to be updated only during the initial fetch
